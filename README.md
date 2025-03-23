@@ -1,2 +1,2 @@
-# road-rash-start-pack
+# road-rash-starter-pack
 Starter pack for a three.js motorcycle game.
