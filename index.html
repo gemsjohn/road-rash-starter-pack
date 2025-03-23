@@ -1,0 +1,541 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Car Environment with Rapier Physics</title>
+    <style>
+        body {
+            margin: 0;
+        }
+
+        canvas {
+            display: block;
+        }
+
+        #debug {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            color: white;
+            background: rgba(0, 0, 0, 0.5);
+            padding: 10px;
+            font-family: Arial, sans-serif;
+        }
+    </style>
+</head>
+
+<body>
+    <div id="debug"></div>
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.module.js",
+                "three/GLTFLoader": "https://cdn.jsdelivr.net/npm/three@0.128.0/examples/jsm/loaders/GLTFLoader.js",
+                "three/OrbitControls": "https://cdn.jsdelivr.net/npm/three@0.128.0/examples/jsm/controls/OrbitControls.js",
+                "rapier": "./rapier.es.js",
+                "three/EffectComposer": "https://cdn.jsdelivr.net/npm/three@0.128.0/examples/jsm/postprocessing/EffectComposer.js",
+                "three/RenderPass": "https://cdn.jsdelivr.net/npm/three@0.128.0/examples/jsm/postprocessing/RenderPass.js",
+                "three/UnrealBloomPass": "https://cdn.jsdelivr.net/npm/three@0.128.0/examples/jsm/postprocessing/UnrealBloomPass.js",
+                "three/FilmPass": "https://cdn.jsdelivr.net/npm/three@0.128.0/examples/jsm/postprocessing/FilmPass.js",
+                "three/SSAOPass": "https://cdn.jsdelivr.net/npm/three@0.128.0/examples/jsm/postprocessing/SSAOPass.js",
+                "three/ShaderPass": "https://cdn.jsdelivr.net/npm/three@0.128.0/examples/jsm/postprocessing/ShaderPass.js",
+                "three/FXAAShader": "https://cdn.jsdelivr.net/npm/three@0.128.0/examples/jsm/shaders/FXAAShader.js"
+            }
+        }
+    </script>
+    <script type="module">
+        import * as THREE from 'three';
+        import { GLTFLoader } from 'three/GLTFLoader';
+        import { OrbitControls } from 'three/OrbitControls';
+        import { EffectComposer } from 'three/EffectComposer';
+        import { RenderPass } from 'three/RenderPass';
+        import { SSAOPass } from 'three/SSAOPass';
+        import { UnrealBloomPass } from 'three/UnrealBloomPass';
+        import { ShaderPass } from 'three/ShaderPass'; // Correct import
+        import { FilmPass } from 'three/FilmPass';
+        import { FXAAShader } from 'three/FXAAShader';
+        import { initPhysics, updatePhysics, world } from './physics.js';
+        import * as RAPIER from 'rapier';
+
+        // Scene Setup (unchanged)
+        const scene = new THREE.Scene();
+        const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 1000);
+        const renderer = new THREE.WebGLRenderer();
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.shadowMap.enabled = true;
+        renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+        document.body.appendChild(renderer.domElement);
+
+        // Post-Processing Composer
+        const composer = new EffectComposer(renderer);
+        const renderPass = new RenderPass(scene, camera);
+        composer.addPass(renderPass);
+
+        const bloomPass = new UnrealBloomPass(new THREE.Vector2(window.innerWidth, window.innerHeight));
+        bloomPass.strength = 0.25;
+        bloomPass.radius = 0;
+        bloomPass.threshold = 0.11;
+        bloomPass.exposure = 2;
+        composer.addPass(bloomPass);
+
+        // Correct FilmPass instantiation
+        const filmPass = new FilmPass(0.35, 0.025, 648, false); // noiseIntensity, scanlinesIntensity, scanlinesCount, grayscale
+        filmPass.renderToScreen = false; // Ensure it doesn't render directly to screen
+        composer.addPass(filmPass);
+
+        // Pixelation Shader
+        const pixelationShader = {
+            uniforms: {
+                tDiffuse: { value: null },
+                resolution: { value: new THREE.Vector2(window.innerWidth, window.innerHeight) },
+                pixelSize: { value: 3.0 } // Adjust this value to control pixelation intensity (higher = more pixelated)
+            },
+            vertexShader: `
+                varying vec2 vUv;
+                void main() {
+                    vUv = uv;
+                    gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+                }
+            `,
+            fragmentShader: `
+                uniform sampler2D tDiffuse;
+                uniform vec2 resolution;
+                uniform float pixelSize;
+                varying vec2 vUv;
+                void main() {
+                    vec2 dxy = pixelSize / resolution;
+                    vec2 coord = dxy * floor(vUv / dxy);
+                    gl_FragColor = texture2D(tDiffuse, coord);
+                }
+            `
+        };
+        const pixelationPass = new ShaderPass(pixelationShader);
+        // composer.addPass(pixelationPass);
+
+        // Correct ShaderPass instantiation for FXAA
+        const fxaaPass = new ShaderPass(FXAAShader);
+        fxaaPass.uniforms['resolution'].value.set(1 / window.innerWidth, 1 / window.innerHeight);
+        composer.addPass(fxaaPass);
+
+        // Clock (unchanged)
+        const clock = new THREE.Clock();
+
+        // Lighting Setup
+        const hemisphereLight = new THREE.HemisphereLight(0xffffff, 0x000000, 1); // intensity: 0
+        scene.add(hemisphereLight);
+
+        const directionalLight = new THREE.DirectionalLight(0xffffff, 1);
+        directionalLight.position.set(5, 10, 7.5);
+        scene.add(directionalLight);
+
+        // Skybox
+        const skyGeometry = new THREE.SphereGeometry(500, 32, 32);
+        const skyUniforms = {
+            minY: { value: 0 },
+            maxY: { value: 100 },
+            colorBottom: { value: new THREE.Color('#c17931') },
+            colorTop: { value: new THREE.Color('#72471d') }
+        };
+        const skyMaterial = new THREE.ShaderMaterial({
+            uniforms: skyUniforms,
+            vertexShader: `
+                varying float vY;
+                void main() {
+                    vY = position.y;
+                    gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+                }
+            `,
+            fragmentShader: `
+                varying float vY;
+                uniform float minY;
+                uniform float maxY;
+                uniform vec3 colorBottom;
+                uniform vec3 colorTop;
+                void main() {
+                    float t = (vY - minY) / (maxY - minY);
+                    t = clamp(t, 0.0, 1.0);
+                    vec3 color = mix(colorBottom, colorTop, t);
+                    gl_FragColor = vec4(color, 1.0);
+                }
+            `,
+            side: THREE.BackSide,
+        });
+        const sky = new THREE.Mesh(skyGeometry, skyMaterial);
+        scene.add(sky);
+
+
+        // Ground (unchanged)
+        const groundGeometry = new THREE.PlaneGeometry(200, 200);
+        const groundMaterial = new THREE.MeshStandardMaterial({
+            roughness: 1,
+            metalness: 0.9,
+            color: 0x2b2b2b,
+        });
+        const ground = new THREE.Mesh(groundGeometry, groundMaterial);
+        ground.rotation.x = -Math.PI / 2;
+        scene.add(ground);
+
+        let grid = new THREE.GridHelper(200, 100, 0xffffff, 0xffffff);
+        grid.material.opacity = 0.2;
+        grid.material.depthWrite = false;
+        grid.material.transparent = true;
+        scene.add(grid);
+
+
+        const textureLoader = new THREE.TextureLoader();
+        textureLoader.load(
+            'assets/wall_texture.jpg',
+            (texture) => {
+                texture.wrapS = THREE.RepeatWrapping;
+                texture.wrapT = THREE.RepeatWrapping;
+                texture.repeat.set(40, 2);
+                const wallMaterial = new THREE.MeshStandardMaterial({
+                    map: texture,
+                    side: THREE.DoubleSide
+                });
+
+                const whiteMaterial = new THREE.MeshStandardMaterial({
+                    roughness: 1.0,
+                    metalness: 0,
+                    color: 0xffffff
+                });
+
+                const rampWidth = 7;
+                const rampThickness = 0.1;
+                const rampLength = 44.5;
+                const rampAngle = Math.asin(4 / 30);
+                const rampBase = Math.sqrt(30 * 30 - 20 * 20);
+                const rampHeight = 0;
+                const rampGeometry = new THREE.BoxGeometry(rampWidth, rampThickness, rampLength);
+                const rampMaterial = new THREE.MeshStandardMaterial({ color: 0x0000ff });
+
+                // **Inner Platform 1 Group: Level 1 Ramp 1 (South)**
+                const innerPlatform1ramp1 = new THREE.Mesh(rampGeometry, whiteMaterial);
+                innerPlatform1ramp1.position.set(-31.5, rampHeight / 2, 35.5);
+                innerPlatform1ramp1.rotation.x = -rampAngle;
+                scene.add(innerPlatform1ramp1);
+
+                // **Inner Platform 1 Group: Level 1 Ramp 1 (West)**
+                const rampGeometry2 = new THREE.BoxGeometry(rampLength, rampThickness, rampWidth);
+                const innerPlatform1ramp2 = new THREE.Mesh(rampGeometry2, whiteMaterial);
+                innerPlatform1ramp2.position.set(-35.5, rampHeight / 2, 31.5);
+                innerPlatform1ramp2.rotation.z = -rampAngle;
+                scene.add(innerPlatform1ramp2);
+
+                // **Exterior Walls**
+
+                const wallNSGeometry = new THREE.BoxGeometry(200, 5, 1);
+                const wallEWGeometry = new THREE.BoxGeometry(1, 5, 200);
+
+                const northWall = new THREE.Mesh(wallNSGeometry, wallMaterial);
+                northWall.position.set(0, 2.5, 100);
+                scene.add(northWall);
+
+                const southWall = new THREE.Mesh(wallNSGeometry, wallMaterial);
+                southWall.position.set(0, 2.5, -100);
+                scene.add(southWall);
+
+                const eastWall = new THREE.Mesh(wallEWGeometry, wallMaterial);
+                eastWall.position.set(100, 2.5, 0);
+                scene.add(eastWall);
+
+                const westWall = new THREE.Mesh(wallEWGeometry, wallMaterial);
+                westWall.position.set(-100, 2.5, 0);
+                scene.add(westWall);
+
+            },
+            (progress) => {
+                console.log(`Loading wall texture: ${(progress.loaded / progress.total * 100).toFixed(2)}%`);
+            },
+            (error) => {
+                console.error('Error loading wall texture:', error);
+            }
+        );
+
+        // Car and Animation Setup
+        let car;
+        let keyLight, fillLight, backLight;
+        let mixer;
+        let staticAction, leftAction, rightAction;
+        let eventQueue;
+        let cube;        // The visual cube mesh
+        let cubeBody;    // The physics rigid body for the cube
+        let spheres = [];
+        let sphereBodies = [];
+
+        const loader = new GLTFLoader();
+        initPhysics().then(() => {
+            console.log('Physics initialized');
+            eventQueue = new RAPIER.EventQueue(true);
+            loader.load(
+                'assets/moto_test.glb',
+                (gltf) => {
+                    car = gltf.scene;
+                    car.scale.set(0.1, 0.1, 0.1);
+                    car.position.set(30, 0.25, 0);
+                    car.rotation.y = Math.PI / 2;
+                    scene.add(car);
+                    updateCamera();
+                    console.log('Car model loaded:', car);
+
+                    // Animation Initialization
+                    mixer = new THREE.AnimationMixer(car);
+                    const animationsArray = gltf.animations;
+
+                    const staticClip = THREE.AnimationClip.findByName(animationsArray, 'char_idle');
+                    const leftClip = THREE.AnimationClip.findByName(animationsArray, 'char_left');
+                    const rightClip = THREE.AnimationClip.findByName(animationsArray, 'char_right');
+
+                    staticAction = mixer.clipAction(staticClip);
+                    leftAction = mixer.clipAction(leftClip);
+                    rightAction = mixer.clipAction(rightClip);
+
+                    staticAction.setLoop(THREE.LoopRepeat);
+                    leftAction.setLoop(THREE.LoopOnce);
+                    leftAction.clampWhenFinished = true;
+                    rightAction.setLoop(THREE.LoopOnce);
+                    rightAction.clampWhenFinished = true;
+
+                    leftAction.timeScale = 0.5;
+                    rightAction.timeScale = 0.5;
+
+                    staticAction.play();
+
+                    // Three-Point Lighting Setup from config
+                    keyLight = new THREE.SpotLight(0x543420, 2); // color: 5524288, intensity: 344
+                    keyLight.position.set(0, 4.2, 3);
+                    keyLight.angle = 0.7853981633974483; // 45 degrees
+                    keyLight.penumbra = 1;
+                    keyLight.castShadow = false;
+                    keyLight.target = car;
+                    scene.add(keyLight);
+
+                    fillLight = new THREE.SpotLight(0x787878, 2); // color: 7895160, intensity: 45
+                    fillLight.position.set(0, 5, -7.4);
+                    fillLight.angle = 0.7853981633974483;
+                    fillLight.penumbra = 1;
+                    fillLight.castShadow = false;
+                    fillLight.target = car;
+                    scene.add(fillLight);
+
+                    backLight = new THREE.SpotLight(0xaec6c7, 2); // color: 11446183, intensity: 299
+                    backLight.position.set(0, 5, -5);
+                    backLight.angle = 0.7853981633974483;
+                    backLight.penumbra = 1;
+                    backLight.castShadow = false;
+                    backLight.target = car;
+                    scene.add(backLight);
+
+                    // Add custom color grading shader
+                    const colorGradingShader = {
+                        uniforms: {
+                            tDiffuse: { value: null },
+                            saturation: { value: 1.2 },
+                            contrast: { value: 1.1 },
+                            tint: { value: new THREE.Vector3(1.1, 1.0, 1.0) },
+                        },
+                        vertexShader: `
+                varying vec2 vUv;
+                void main() {
+                    vUv = uv;
+                    gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+                }
+            `,
+                        fragmentShader: `
+                uniform sampler2D tDiffuse;
+                uniform float saturation;
+                uniform float contrast;
+                uniform vec3 tint;
+                varying vec2 vUv;
+                void main() {
+                    vec4 color = texture2D(tDiffuse, vUv);
+                    color.rgb = (color.rgb - 0.5) * contrast + 0.5;
+                    color.rgb = clamp(color.rgb, 0.0, 1.0);
+                    float luminance = dot(color.rgb, vec3(0.2126, 0.7152, 0.0722));
+                    vec3 grayscale = vec3(luminance);
+                    color.rgb = mix(grayscale, color.rgb, saturation);
+                    color.rgb = clamp(color.rgb, 0.0, 1.0);
+                    color.rgb *= tint;
+                    color.rgb = clamp(color.rgb, 0.0, 1.0);
+                    gl_FragColor = color;
+                }
+            `,
+                    };
+                    const colorGradingPass = new ShaderPass(colorGradingShader);
+                    composer.addPass(colorGradingPass);
+
+                    animate();
+
+                },
+                (progress) => {
+                    console.log(`Loading model: ${(progress.loaded / progress.total * 100).toFixed(2)}%`);
+                },
+                (error) => {
+                    console.error('Error loading GLTF model:', error);
+                }
+            );
+        });
+
+        // Camera
+        const cameraOffset = new THREE.Vector3(0, 2, -3.5);
+        const cameraLookAtOffset = new THREE.Vector3(0, 1, 0);
+
+        function updateCamera() {
+            if (!car) return;
+
+            const carPosition = car.position.clone();
+            const carDirection = new THREE.Vector3(0, 0, -1).applyQuaternion(car.quaternion);
+
+            // Camera position offset
+            const positionOffset = carDirection.multiplyScalar(cameraOffset.z);
+            positionOffset.y = cameraOffset.y;
+            camera.position.copy(carPosition).add(positionOffset);
+
+            // Camera lookAt offset
+            const lookAtOffset = carDirection.clone().multiplyScalar(cameraLookAtOffset.z);
+            lookAtOffset.y = cameraLookAtOffset.y;
+            const lookAtPosition = carPosition.clone().add(lookAtOffset);
+
+            camera.lookAt(lookAtPosition);
+        }
+
+        // Keyboard Controls and Animation Logic
+        const keys = { w: false, a: false, s: false, d: false };
+        let currentTurnAction = null;
+
+        window.addEventListener('keydown', (event) => {
+            if (event.key in keys) keys[event.key] = true;
+            if (mixer) {
+                if (event.key === 'a' && currentTurnAction !== leftAction) {
+                    // console.log("A key pressed: Starting Kart_Turn_Left");
+                    if (currentTurnAction) currentTurnAction.stop();
+                    staticAction.stop();
+                    leftAction.reset().play();
+                    currentTurnAction = leftAction;
+                } else if (event.key === 'd' && currentTurnAction !== rightAction) {
+                    // console.log("D key pressed: Starting Kart_Turn_Right");
+                    if (currentTurnAction) currentTurnAction.stop();
+                    staticAction.stop();
+                    rightAction.reset().play();
+                    currentTurnAction = rightAction;
+                }
+            }
+        });
+
+        window.addEventListener('keyup', (event) => {
+            if (event.key in keys) keys[event.key] = false;
+            if (mixer) {
+                if (event.key === 'a' && currentTurnAction === leftAction) {
+                    // console.log("A key released: Returning to Kart_Static");
+                    currentTurnAction.stop();
+                    staticAction.reset().play();
+                    currentTurnAction = null;
+                } else if (event.key === 'd' && currentTurnAction === rightAction) {
+                    // console.log("D key released: Returning to Kart_Static");
+                    currentTurnAction.stop();
+                    staticAction.reset().play();
+                    currentTurnAction = null;
+                }
+            }
+        });
+
+        // Mouse Controls for Firing Spheres
+        document.addEventListener('keydown', (event) => {
+            if (event.key === ' ' && car) { // Left click
+                const availableSpheres = spheres.filter(s => !s.userData.isFired);
+                if (availableSpheres.length > 0) {
+                    const sphere = availableSpheres[0];
+                    sphere.userData.isFired = true;
+                    const sphereIndex = spheres.indexOf(sphere);
+                    const sphereBody = sphereBodies[sphereIndex];
+                    const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(car.quaternion);
+                    const launchSpeed = 80;
+                    sphereBody.setLinvel({ x: forward.x * launchSpeed, y: 0, z: forward.z * launchSpeed }, true);
+                    console.log(`Fired sphere ${sphereIndex}`);
+                }
+            }
+        });
+
+        // Update Spheres Function
+        const orbitRadius = 2;
+        const orbitSpeed = 2;
+        function updateSpheres(delta) {
+            const time = clock.getElapsedTime();
+            spheres.forEach((sphere, index) => {
+                if (sphere.userData.isFired) {
+                    const position = sphereBodies[index].translation();
+                    sphere.position.set(position.x, position.y, position.z);
+                } else {
+                    const angle = (index * 2 * Math.PI / 3) + time * orbitSpeed;
+                    const offset = new THREE.Vector3(
+                        Math.cos(angle) * orbitRadius,
+                        0.25,
+                        Math.sin(angle) * orbitRadius
+                    );
+                    sphere.position.copy(car.position).add(offset);
+                    sphereBodies[index].setTranslation(
+                        { x: sphere.position.x, y: sphere.position.y, z: sphere.position.z },
+                        true
+                    );
+                }
+            });
+        }
+
+        // Animation Loop
+        let speed = 0;
+        let physicsRampMeshes = []; // Store physics ramp visualizations
+        let physicsWallMeshes = []; // Store physics ramp visualizations
+        let physicsPlatformMeshes = []; // Store physics ramp visualizations
+
+
+        function animate() {
+            requestAnimationFrame(animate);
+            const delta = clock.getDelta();
+            if (car) {
+
+                const { position, rotation, displaySpeed, velocity, ramps, walls, platforms } = updatePhysics(delta, keys, eventQueue);
+                car.position.set(position.x, position.y, position.z);
+                car.quaternion.set(rotation.x, rotation.y, rotation.z, rotation.w);
+                speed = displaySpeed;
+
+                if (keyLight && fillLight && backLight) {
+                    const carPosition = car.position;
+                    const carQuaternion = car.quaternion;
+
+                    const keyLightOffset = new THREE.Vector3(-2.5, 5, 5);
+                    keyLight.position.copy(keyLightOffset).applyQuaternion(carQuaternion).add(carPosition);
+
+                    const fillLightOffset = new THREE.Vector3(2.5, 5, 5);
+                    fillLight.position.copy(fillLightOffset).applyQuaternion(carQuaternion).add(carPosition);
+
+                    const backLightOffset = new THREE.Vector3(0, 5, -5);
+                    backLight.position.copy(backLightOffset).applyQuaternion(carQuaternion).add(carPosition);
+                }
+            }
+            updateCamera();
+            if (car) {
+                const position = car.position;
+                document.getElementById('debug').innerHTML = `
+                    Position: (${position.x.toFixed(2)}, ${position.y.toFixed(2)}, ${position.z.toFixed(2)})<br>
+                    Speed: ${speed.toFixed(2)} m/s
+                `;
+            }
+            if (mixer) mixer.update(delta);
+            composer.render();
+        }
+
+        // Window Resize Handler
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            composer.setSize(window.innerWidth, window.innerHeight);
+            bloomPass.setSize(window.innerWidth, window.innerHeight);
+            fxaaPass.uniforms['resolution'].value.set(1 / window.innerWidth, 1 / window.innerHeight);
+        });
+    </script>
+</body>
+
+</html>
